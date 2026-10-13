@@ -1,0 +1,2006 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+__author__ = "bibow"
+
+import json
+import logging
+import re
+import threading
+from decimal import Decimal
+from queue import Queue
+from typing import Any, Dict, List, Optional
+
+import openai
+import pendulum
+from llm_provider_base import LlmProviderHandler
+from silvaengine_utility import Debugger, Serializer
+from silvaengine_utility.performance_monitor import performance_monitor
+
+
+def _omit_none(d: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in d.items() if v is not None}
+
+
+def _truncate(s: str, limit: int = 200) -> str:
+    if s is None:
+        return ""
+    return s if len(s) <= limit else f"{s[:limit]}...({len(s)} chars)"
+
+
+class _ThinkTagSplitter:
+    """
+    Stream-aware splitter for inline <think>...</think> reasoning blocks.
+
+    Used when an upstream server returns reasoning bundled into `content`
+    rather than a dedicated field. Each call to feed(chunk) returns
+    (content, thinking) pieces ready to emit. Partial tag matches at the
+    buffer tail are held until enough characters arrive to split them.
+    """
+
+    OPEN = "<think>"
+    CLOSE = "</think>"
+
+    def __init__(self) -> None:
+        self.in_think = False
+        self.buffer = ""
+
+    @staticmethod
+    def _partial_tag_suffix(text: str, tag: str) -> int:
+        max_length = min(len(text), len(tag) - 1)
+        for length in range(max_length, 0, -1):
+            if text.endswith(tag[:length]):
+                return length
+        return 0
+
+    def feed(self, chunk: str) -> tuple[str, str]:
+        self.buffer += chunk
+        content_parts: List[str] = []
+        think_parts: List[str] = []
+        while self.buffer:
+            if not self.in_think:
+                idx = self.buffer.find(self.OPEN)
+                if idx == -1:
+                    keep = self._partial_tag_suffix(self.buffer, self.OPEN)
+                    if len(self.buffer) > keep:
+                        content_parts.append(
+                            self.buffer[:-keep] if keep else self.buffer
+                        )
+                        self.buffer = self.buffer[-keep:] if keep else ""
+                    break
+                if idx > 0:
+                    content_parts.append(self.buffer[:idx])
+                self.buffer = self.buffer[idx + len(self.OPEN) :]
+                self.in_think = True
+            else:
+                idx = self.buffer.find(self.CLOSE)
+                if idx == -1:
+                    keep = self._partial_tag_suffix(self.buffer, self.CLOSE)
+                    if len(self.buffer) > keep:
+                        think_parts.append(self.buffer[:-keep] if keep else self.buffer)
+                        self.buffer = self.buffer[-keep:] if keep else ""
+                    break
+                if idx > 0:
+                    think_parts.append(self.buffer[:idx])
+                self.buffer = self.buffer[idx + len(self.CLOSE) :]
+                self.in_think = False
+        return "".join(content_parts), "".join(think_parts)
+
+    def flush(self) -> tuple[str, str]:
+        tail = self.buffer
+        self.buffer = ""
+        if self.in_think:
+            return "", tail
+        return tail, ""
+
+
+class OpenAIChatProvider(LlmProviderHandler):
+    """
+    Manages conversations and function calls via OpenAI's Chat Completions API.
+    Compatible with OpenAI, SGLang, vLLM, and other OpenAI-compatible servers.
+    """
+    # ------------------------------------------------------------------
+    # Plugin metadata (discovered by llm_engine via the entry point)
+    # ------------------------------------------------------------------
+    api_protocol = "openai-completions"
+    #: llm_engine built-in protocol this plugin takes over (plan D8).
+    replaces_protocol = "OPENAI_COMPATIBLE"
+    display_name = "OpenAI (Chat Completions)"
+    contract_version = "1"
+    fallback_protocol = None
+    capabilities = {
+        "streaming": True,
+        "tools": True,
+        "vision": True,
+        "reasoning": True,
+        "list_models": True,
+    }
+    default_pool_name = "httpx_llm_openai"
+    #: Configuration keys that configure the client, never sent as request
+    #: parameters (subclasses extend this, e.g. Azure).
+    client_config_keys: tuple = ()
+
+    def __init__(
+        self,
+        logger: logging.Logger,
+        agent: Dict[str, Any],
+        **setting: Dict[str, Any],
+    ) -> None:
+        try:
+            LlmProviderHandler.__init__(self, logger, agent, **setting)
+
+            config = self.agent.get("configuration", {})
+
+            # Plugin contract (plan D7 / CREDS / A.4): the pooled httpx client
+            # is injected by llm_engine (plan §5.2.1) and borrowed for the
+            # whole call; credentials from ctx.credentials; SDK retries off.
+            self._http_client = (
+                getattr(self.ctx, "http_client", None) if self.ctx else None
+            )
+            if self._http_client is None:
+                raise Exception(
+                    "OpenAIChatProvider requires ctx.http_client "
+                    "(the pooled client injected by llm_engine's "
+                    "HandlerProviderAdapter, plan §5.2.1)"
+                )
+
+            openai_api_key = (
+                self.credentials.get("openai_api_key")
+                or self.credentials.get("api_key")
+                or ""
+            ).strip() or None
+            self.client = self._build_client(config, openai_api_key)
+
+            # Normalize tool shape BEFORE enabled_tools filtering, since
+            # mcp_http_client.export_tools_for_llm("gpt", ...) emits the
+            # Responses API flat shape {"type":"function","name":...,
+            # "parameters":...} while Chat Completions requires the nested
+            # shape {"type":"function","function":{"name":..., ...}}.
+            if "tools" in config and config["tools"]:
+                config["tools"] = self._normalize_tools_to_chat_completions(
+                    config["tools"]
+                )
+                # Sort tools by function name for deterministic ordering.
+                # This maximizes prefix-cache hits on Together.ai (prefix-based caching).
+                config["tools"].sort(
+                    key=lambda t: t.get("function", {}).get("name", "")
+                )
+
+            # Only apply enabled_tools filter when a non-empty allowlist is
+            # provided. An empty list means "no filter, keep all tools" — not
+            # "filter everything out" (which was the previous behavior).
+            enabled_tools = config.get("enabled_tools")
+            if enabled_tools:
+                enabled_set = set(enabled_tools)
+                if "tools" in config:
+                    config["tools"] = [
+                        tool
+                        for tool in config["tools"]
+                        if tool.get("function", {}).get("name") in enabled_set
+                    ]
+
+            self._assemble_extra_body(config)
+
+            self.model_setting = {}
+            for k, v in config.items():
+                if k in self.client_config_keys:
+                    continue
+                if k in [
+                    "openai_api_key",
+                    "base_url",
+                    "enabled_tools",
+                    "request_timeout_seconds",
+                    "connect_timeout_seconds",
+                    "pool_max_connections",
+                    "pool_max_keepalive_connections",
+                    "max_retries",
+                    "max_tool_call_depth",
+                    "instructions_role",
+                    "enable_thinking",
+                    "separate_reasoning",
+                    "enable_think_tag_split",
+                    "debug_log_request_messages",
+                    "tool_history_compatibility",
+                    "reasoning_mask_char",
+                ]:
+                    continue
+                if k == "max_tokens":
+                    v = int(v)
+                elif k == "max_completion_tokens":
+                    v = int(v)
+                elif k in [
+                    "temperature",
+                    "top_p",
+                    "presence_penalty",
+                    "frequency_penalty",
+                ]:
+                    v = float(v)
+                elif isinstance(v, Decimal):
+                    v = float(v)
+                elif k in {
+                    "extra_body",
+                    "extra_headers",
+                    "extra_query",
+                    "logit_bias",
+                }:
+                    # Some upstream serializers emit `[]` for empty dict-typed
+                    # fields (or the field arrives as an unexpected list). The
+                    # OpenAI SDK does `**value` on these — a list crashes with
+                    # `TypeError: 'list' object is not a mapping`. Skip the
+                    # field entirely so downstream code sees "unset", not
+                    # None (which would still trip .get(...).get(...) chains).
+                    if isinstance(v, list):
+                        if v and self.logger and self.logger.isEnabledFor(
+                            logging.WARNING
+                        ):
+                            self.logger.warning(
+                                f"Config field {k!r} arrived as a non-empty list; "
+                                f"expected dict/object. Dropping it. Value: "
+                                f"{_truncate(str(v))}"
+                            )
+                        continue
+                elif k == "response_format":
+                    # A malformed `response_format` (e.g. json_schema.schema
+                    # arriving as `[]`) causes providers to reject the request.
+                    # Skip it entirely rather than storing None.
+                    if isinstance(v, dict):
+                        js = v.get("json_schema")
+                        if isinstance(js, dict) and isinstance(js.get("schema"), list):
+                            if self.logger and self.logger.isEnabledFor(
+                                logging.WARNING
+                            ):
+                                self.logger.warning(
+                                    "response_format.json_schema.schema is a list; "
+                                    "expected object. Dropping response_format."
+                                )
+                            continue
+                self.model_setting[k] = v
+
+            if (
+                "max_completion_tokens" in self.model_setting
+                and "max_tokens" in self.model_setting
+            ):
+                if self.logger and self.logger.isEnabledFor(logging.WARNING):
+                    self.logger.warning(
+                        "Both max_tokens and max_completion_tokens are set. "
+                        "Preferring max_completion_tokens."
+                    )
+                del self.model_setting["max_tokens"]
+
+            self._tools_list = self.model_setting.get("tools", [])
+            if not self._tools_list:
+                self.model_setting.pop("tools", None)
+                self.model_setting.pop("tool_choice", None)
+                self.model_setting.pop("parallel_tool_calls", None)
+            elif self.logger and self.logger.isEnabledFor(logging.INFO):
+                # One-time diagnostic so on-wire tool shape is visible in Lambda logs.
+                bad = [
+                    t
+                    for t in self._tools_list
+                    if not (isinstance(t, dict) and isinstance(t.get("function"), dict))
+                ]
+                self.logger.info(
+                    f"[TOOLS_LOADED] count={len(self._tools_list)} "
+                    f"malformed={len(bad)} "
+                    f"names={[(t.get('function') or {}).get('name') for t in self._tools_list]}"
+                )
+                if bad:
+                    self.logger.warning(
+                        f"[TOOLS_MALFORMED] {len(bad)} tool(s) missing nested "
+                        f"`function` field will be rejected by Chat Completions. "
+                        f"First bad tool keys: {list(bad[0].keys()) if isinstance(bad[0], dict) else type(bad[0])}"
+                    )
+
+            self.instructions_role = str(config.get("instructions_role", "system"))
+            # Set per call by ask_model; defaulted here so handle_stream is
+            # safe to call on its own (single-turn contract).
+            self._conversation_content_started = False
+            self._enable_think_tag_split = bool(
+                config.get("enable_think_tag_split", False)
+            )
+            self._debug_log_request_messages = bool(
+                config.get("debug_log_request_messages", False)
+            )
+            self._tool_history_compatibility = str(
+                config.get("tool_history_compatibility", "auto")
+            ).lower()
+            # Masking is enabled iff reasoning_mask_char is a non-empty string.
+            # Take the first char to guarantee single-char replacement even
+            # when someone hands in a multi-char string.
+            raw_mask = config.get("reasoning_mask_char")
+            self._reasoning_mask_char = (
+                str(raw_mask)[:1] if raw_mask else ""
+            )
+            # `or {}` handles the case where response_format is stored as
+             # None (see the sanitization branch above that drops a malformed
+             # schema by setting the value to None so _omit_none strips it
+             # from the payload later).
+            self.output_format_type = (
+                self.model_setting.get("response_format") or {}
+            ).get("type", "text")
+            self.enable_timeline_log = setting.get("enable_timeline_log", False)
+            self._tools_cache_valid = False
+
+            self._last_usage = None
+            self._last_finish_reason = None
+            self._last_latency_ms = None
+            self._last_request_id = None
+        except Exception as e:
+            Debugger.info(variable=e, stage=f"{__name__}:__init__")
+            raise
+
+    def close(self) -> None:
+        if hasattr(self, "_http_client") and self._http_client is not None:
+            self._http_client.close()
+            self._http_client = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+    def _check_retry_limit(self, retry_count: int, max_retries: int = 2) -> None:
+        if retry_count > max_retries:
+            error_msg = f"Maximum empty-response retry limit ({max_retries}) exceeded"
+            if self.logger and self.logger.isEnabledFor(logging.ERROR):
+                self.logger.error(error_msg)
+            raise Exception(error_msg)
+
+    def _has_valid_content(self, text: Optional[str]) -> bool:
+        return bool(text and text.strip())
+
+    @staticmethod
+    def _empty_visible_content_message(finish_reason: Optional[str]) -> str:
+        if finish_reason == "length":
+            return (
+                "The model response was truncated before producing visible content. "
+                "Increase max_completion_tokens or shorten the prompt/context, then retry."
+            )
+        if finish_reason == "content_filter":
+            return "The model response was filtered before producing visible content."
+        return "The model returned reasoning but no visible content."
+
+    def _apply_reasoning_mask(self, text: str) -> str:
+        """Replace every non-whitespace reasoning char with the configured
+        mask char when `reasoning_mask_char` is set. When the config is
+        blank/None, reasoning streams through as-is. Whitespace passes
+        through so line breaks/spaces still shape the visible output."""
+        if not self._reasoning_mask_char or not text:
+            return text
+        ch = self._reasoning_mask_char
+        return "".join(ch if c and not c.isspace() else c for c in text)
+
+    @staticmethod
+    def _get_reasoning_content(part: Any) -> Optional[str]:
+        for field_name in ("reasoning_content", "reasoning", "thinking"):
+            value = getattr(part, field_name, None)
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+    @staticmethod
+    def _split_inline_reasoning(content: str) -> tuple[str, str]:
+        splitter = _ThinkTagSplitter()
+        visible, reasoning = splitter.feed(content)
+        tail_visible, tail_reasoning = splitter.flush()
+        return visible + tail_visible, reasoning + tail_reasoning
+
+    def _get_elapsed_time(self) -> float:
+        if not hasattr(self, "_global_start_time") or self._global_start_time is None:
+            return 0.0
+        return (pendulum.now("UTC") - self._global_start_time).total_seconds() * 1000
+
+    def reset_timeline(self) -> None:
+        self._global_start_time = None
+        if (
+            self.enable_timeline_log
+            and self.logger
+            and self.logger.isEnabledFor(logging.INFO)
+        ):
+            self.logger.info("[TIMELINE] Timeline reset for new run")
+
+    def to_native_messages(
+        self, input_messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Neutral (OpenAI-style) → Chat Completions native (plan §5.5/A.4).
+
+        This provider's wire format **is** the neutral format — messages
+        pass through with two normalisations:
+
+        - assistant ``provider_state`` is not needed by Chat Completions
+          and is stripped;
+        - assistant ``tool_calls`` arguments stay as the JSON string the
+          API expects.
+        """
+        native: List[Dict[str, Any]] = []
+        for message in input_messages:
+            role = str(message.get("role", "")).lower()
+
+            if role == "system":
+                # Instructions keep the configured ``instructions_role``
+                # handling inside ``invoke_model`` (legacy behaviour kept).
+                native.append(
+                    {"role": "system", "content": message.get("content") or ""}
+                )
+                continue
+
+            if role == "assistant":
+                outgoing: Dict[str, Any] = {
+                    "role": "assistant",
+                    "content": message.get("content") or "",
+                }
+                tool_calls = message.get("tool_calls") or []
+                if tool_calls:
+                    converted = []
+                    for tool_call in tool_calls:
+                        function = tool_call.get("function") or {}
+                        arguments = function.get("arguments") or "{}"
+                        converted.append(
+                            {
+                                "id": str(tool_call.get("id") or ""),
+                                "type": "function",
+                                "function": {
+                                    "name": str(function.get("name") or ""),
+                                    "arguments": str(arguments),
+                                },
+                            }
+                        )
+                    outgoing["tool_calls"] = converted
+                native.append(outgoing)
+                continue
+
+            if role == "tool":
+                native.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": str(message.get("tool_call_id") or ""),
+                        "content": self._tool_content_for_llm(
+                            message.get("content") or ""
+                        ),
+                    }
+                )
+                continue
+
+            native.append(
+                {"role": role or "user", "content": message.get("content") or ""}
+            )
+        return native
+
+    @staticmethod
+    def _map_usage(raw: Any) -> Dict[str, Any]:
+        """Chat Completions ``usage`` → plan §5.3 shape (usage was
+        already read by this handler — this maps it to plan keys)."""
+        if raw is None:
+            return {}
+        def _int(value):
+            try:
+                return int(value or 0)
+            except (TypeError, ValueError):
+                return 0
+        prompt = _int(getattr(raw, "prompt_tokens", 0))
+        completion = _int(getattr(raw, "completion_tokens", 0))
+        usage = {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": _int(getattr(raw, "total_tokens", prompt + completion)),
+        }
+        details = getattr(raw, "prompt_tokens_details", None)
+        cached = _int(getattr(details, "cached_tokens", 0))
+        if cached:
+            usage["cache_read_tokens"] = cached
+        return usage
+
+    def _redact_api_key(self, text: str) -> str:
+        return re.sub(r"(sk-|key[\"':\s]*)\S{4,}", r"\1****", text)
+
+    def _log_model_call(
+        self,
+        model: str,
+        request_id: Optional[str],
+        stream: bool,
+        tool_call_count: int,
+        usage: Any,
+        latency_ms: Optional[float],
+        finish_reason: Optional[str],
+        retry_count: int,
+    ) -> None:
+        if not self.logger or not self.logger.isEnabledFor(logging.INFO):
+            return
+        prompt_tokens = getattr(usage, "prompt_tokens", None) if usage else None
+        completion_tokens = getattr(usage, "completion_tokens", None) if usage else None
+        total_tokens = getattr(usage, "total_tokens", None) if usage else None
+        latency_str = f"{latency_ms:.1f}" if latency_ms is not None else "None"
+        self.logger.info(
+            f"[MODEL_CALL] model={model} request_id={request_id} stream={stream} "
+            f"tool_calls={tool_call_count} prompt_tokens={prompt_tokens} "
+            f"completion_tokens={completion_tokens} total_tokens={total_tokens} "
+            f"latency_ms={latency_str} finish_reason={finish_reason} "
+            f"retry_count={retry_count}"
+        )
+
+    def _assemble_extra_body(self, config: Dict[str, Any]) -> None:
+        """
+        Convert SGLang/Qwen3 shorthand config keys into the nested
+        `extra_body` structure that chat.completions.create() expects.
+
+        Recognized shorthand keys (top-level in `configuration`):
+            enable_thinking    -> extra_body["chat_template_kwargs"]["enable_thinking"]
+            separate_reasoning -> extra_body["separate_reasoning"]
+
+        Z.AI GLM expects `extra_body={"thinking": {"type": "enabled"}}`.
+        Supply that explicitly rather than combining two providers' extension
+        keys in the same request.
+
+        Anything the caller has already placed in `extra_body` wins; this method
+        only fills missing slots so users can always override by setting
+        `extra_body` directly.
+        """
+        shorthand: Dict[str, Any] = {}
+        if "enable_thinking" in config and config["enable_thinking"] is not None:
+            shorthand["chat_template_kwargs"] = {
+                "enable_thinking": bool(config["enable_thinking"])
+            }
+        if "separate_reasoning" in config and config["separate_reasoning"] is not None:
+            shorthand["separate_reasoning"] = bool(config["separate_reasoning"])
+
+        if not shorthand:
+            return
+
+        explicit = config.get("extra_body") or {}
+        merged: Dict[str, Any] = dict(shorthand)
+        for k, v in explicit.items():
+            if (
+                k == "chat_template_kwargs"
+                and isinstance(v, dict)
+                and isinstance(merged.get(k), dict)
+            ):
+                merged[k] = {**merged[k], **v}
+            else:
+                merged[k] = v
+        config["extra_body"] = merged
+
+    @staticmethod
+    def _normalize_tools_to_chat_completions(
+        tools: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Normalize tool definitions to the Chat Completions nested shape.
+
+        Accepted input shapes (preserved or converted to the same output):
+            Responses API flat:
+                {"type":"function","name":"x","description":"...","parameters":{...}}
+            Chat Completions nested:
+                {"type":"function","function":{"name":"x","description":"...","parameters":{...}}}
+
+        Anything that doesn't match either pattern is passed through unchanged.
+        """
+        normalized: List[Dict[str, Any]] = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                normalized.append(tool)
+                continue
+            if isinstance(tool.get("function"), dict):
+                normalized.append(tool)
+                continue
+            if tool.get("type") == "function" and "name" in tool:
+                normalized.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": tool["name"],
+                            "description": tool.get("description", ""),
+                            "parameters": tool.get("parameters", {}),
+                        },
+                    }
+                )
+                continue
+            normalized.append(tool)
+        return normalized
+
+    def _merge_instructions_into_first_user(
+        self, messages: List[Dict[str, Any]], instructions: str
+    ) -> List[Dict[str, Any]]:
+        merged = list(messages)
+        for i, msg in enumerate(merged):
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if isinstance(content, str):
+                merged[i] = {**msg, "content": f"{instructions}\n\n{content}"}
+            elif isinstance(content, list):
+                merged[i] = {
+                    **msg,
+                    "content": [{"type": "text", "text": instructions}] + content,
+                }
+            else:
+                merged[i] = {**msg, "content": instructions}
+            return merged
+        return [{"role": "user", "content": instructions}] + merged
+
+    @staticmethod
+    def _validate_image_url(url: str) -> None:
+        """Raise ValueError if the image URL scheme is unsupported."""
+        allowed = {"http", "https", "data"}
+        scheme = url.split(":", 1)[0].lower()
+        if scheme not in allowed:
+            raise ValueError(
+                f"Unsupported image URL scheme '{scheme}'. "
+                f"Allowed schemes: {', '.join(sorted(allowed))}."
+            )
+
+    @staticmethod
+    def _build_image_message(
+        image_url: str, text: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Build a Chat Completions content array containing an image."""
+        OpenAIChatProvider._validate_image_url(image_url)
+        content: List[Dict[str, Any]] = [
+            {"type": "image_url", "image_url": {"url": image_url}}
+        ]
+        if text:
+            content.insert(0, {"type": "text", "text": text})
+        return {"role": "user", "content": content}
+
+    def _needs_plain_tool_history(self) -> bool:
+        """
+        Return true when a provider cannot render strict tool history.
+
+        Auto-detects Together.ai chat templates known to fail on the
+        spec-compliant assistant.tool_calls + role:tool shape. Symptom is a
+        400 with `Failed to render template: invalid operation: object is
+        not callable (in chat:N)`. Observed on Together.ai's GLM-5.x and
+        MiniMax-M3 templates; likely applies to any Together.ai model whose
+        template does not properly guard tool-history rendering.
+
+        Callers can force either behavior via `tool_history_compatibility`:
+            "flatten" | "plain" | "compat"  -> always render as text transcript
+            "strict"  | "off"   | "false"   -> never render as text
+            unset                            -> auto-detect (default)
+        """
+        mode = self._tool_history_compatibility
+        if mode in {"strict", "off", "false"}:
+            return False
+        if mode in {"flatten", "plain", "compat"}:
+            return True
+
+        base_url = str(self.agent.get("configuration", {}).get("base_url") or "")
+        model = str(self.model_setting.get("model") or "").lower()
+        if "together.ai" not in base_url.lower():
+            return False
+        # Known-broken Together.ai templates. Extend this list as new models
+        # exhibit the same "object is not callable" failure.
+        broken_model_markers = ("glm", "minimax")
+        return any(marker in model for marker in broken_model_markers)
+
+    @staticmethod
+    def _render_tool_history_as_text(
+        messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Convert strict tool protocol messages into plain transcript messages.
+
+        This is only for provider templates that reject standard
+        assistant.tool_calls + role:tool history on the next request. It keeps
+        the tool name, id, arguments, and result visible to the model.
+        """
+        rendered: List[Dict[str, Any]] = []
+        tool_names_by_id: Dict[str, str] = {}
+
+        for msg in messages:
+            if not isinstance(msg, dict):
+                rendered.append(msg)
+                continue
+
+            role = msg.get("role")
+            tool_calls = msg.get("tool_calls")
+            if role == "assistant" and isinstance(tool_calls, list):
+                if msg.get("content"):
+                    rendered.append({"role": "assistant", "content": msg["content"]})
+
+                lines = []
+                for tc in tool_calls:
+                    if not isinstance(tc, dict):
+                        continue
+                    tc_id = str(tc.get("id") or "unknown")
+                    function = tc.get("function") or {}
+                    name = str(function.get("name") or "unknown_tool")
+                    arguments = function.get("arguments", "{}")
+                    tool_names_by_id[tc_id] = name
+                    lines.append(f"- {name} id={tc_id} arguments={arguments}")
+                if lines:
+                    rendered.append(
+                        {
+                            "role": "assistant",
+                            "content": "Tool call executed:\n" + "\n".join(lines),
+                        }
+                    )
+                continue
+
+            if role == "tool":
+                tc_id = str(msg.get("tool_call_id") or "unknown")
+                name = tool_names_by_id.get(tc_id, "unknown_tool")
+                rendered.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Tool result from {name} id={tc_id}:\n"
+                            f"{msg.get('content', '')}"
+                        ),
+                    }
+                )
+                continue
+
+            rendered.append(msg)
+
+        return rendered
+
+    @staticmethod
+    def _validate_tool_messages(messages: List[Dict[str, Any]]) -> None:
+        """
+        Defensive pre-flight: reject `role: "tool"` messages missing the
+        required `tool_call_id` field BEFORE sending to the provider.
+
+        Without this, a malformed message reaches the server and comes back as
+        a generic 400 `missing field 'tool_call_id'` (e.g. Together.ai GLM:
+        `messages[N]: missing field 'tool_call_id' at line 1 column 89231`)
+        with no indication of who emitted the bad message. Raising here with
+        the offending index and a content preview turns it into a loud,
+        debuggable client-side error so the upstream emitter can be found.
+
+        Also flags an orphan `tool` message whose preceding assistant message
+        does not carry `tool_calls` — strict providers reject that shape too.
+        """
+        if not messages:
+            return
+        # Map of tool_call ids present on assistant messages in the window.
+        parent_ids: set = set()
+        for i, msg in enumerate(messages):
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") == "assistant" and isinstance(
+                msg.get("tool_calls"), list
+            ):
+                for tc in msg["tool_calls"]:
+                    if isinstance(tc, dict) and tc.get("id"):
+                        parent_ids.add(tc["id"])
+
+        for i, msg in enumerate(messages):
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+            tc_id = msg.get("tool_call_id")
+            if not tc_id:
+                preview = _truncate(Serializer.json_dumps(msg), 300)
+                raise ValueError(
+                    f"messages[{i}] has role='tool' but is missing required "
+                    f"'tool_call_id'. This is usually caused by reconstructing "
+                    f"messages from _short_term_memory (where tool_call_id is "
+                    f"nested inside the content JSON) or from caller-supplied "
+                    f"history. Offending message: {preview}"
+                )
+            if tc_id not in parent_ids:
+                preview = _truncate(Serializer.json_dumps(msg), 300)
+                raise ValueError(
+                    f"messages[{i}] has tool_call_id='{tc_id}' but no preceding "
+                    f"assistant message carries that tool_call id. The parent "
+                    f"assistant message was likely trimmed away. Offending "
+                    f"message: {preview}"
+                )
+
+    def invoke_model(self, **kwargs: Dict[str, Any]) -> Any:
+        try:
+            if self.enable_timeline_log:
+                invoke_start = pendulum.now("UTC")
+
+            payload = dict(self.model_setting, **kwargs)
+
+            messages = payload.get("messages") or []
+            instructions = self.agent.get("instructions")
+            if instructions and not (
+                messages and messages[0].get("role") in {"system", "developer"}
+            ):
+                if self.instructions_role == "user":
+                    messages = self._merge_instructions_into_first_user(
+                        messages, instructions
+                    )
+                else:
+                    messages = [
+                        {"role": self.instructions_role, "content": instructions}
+                    ] + messages
+
+            payload["messages"] = messages
+
+            # Pre-flight: catch any remaining malformed `role: "tool"` messages
+            # before the provider rejects them with an opaque 400.
+            self._validate_tool_messages(messages)
+
+            # Ensure tool_calls[].function.arguments is a JSON string per the
+            # OpenAI Chat Completions spec.  Together.ai's deserializer rejects
+            # dict/object values with a 400; their GLM-5.2 Jinja2 template also
+            # calls .items() on the value and fails on a string.  This is a
+            # Together.ai server bug — their template should json.loads the
+            # string before traversal.  We send the spec-compliant string form;
+            # providers that follow the spec (OpenAI, vLLM, SGLang) accept it.
+            for msg in messages:
+                if msg.get("tool_calls"):
+                    for tc in msg["tool_calls"]:
+                        func = tc.get("function")
+                        if func and not isinstance(func.get("arguments"), str):
+                            func["arguments"] = json.dumps(
+                                func["arguments"], ensure_ascii=False
+                            )
+
+            if self._needs_plain_tool_history():
+                rendered_messages = self._render_tool_history_as_text(messages)
+                if rendered_messages != messages:
+                    messages = rendered_messages
+                    payload["messages"] = messages
+                    payload.pop("tool_choice", None)
+                    payload.pop("parallel_tool_calls", None)
+                    if self.logger and self.logger.isEnabledFor(logging.INFO):
+                        self.logger.info(
+                            "[TOOL_HISTORY_COMPAT] rendered strict tool history "
+                            "as plain text for provider compatibility"
+                        )
+
+            if payload.get("stream"):
+                payload["stream_options"] = {"include_usage": True}
+            else:
+                payload.pop("stream_options", None)
+
+            if (
+                self._debug_log_request_messages
+                and self.logger
+                and self.logger.isEnabledFor(logging.INFO)
+            ):
+                try:
+                    dumped = json.dumps(payload.get("messages", []), default=str)
+                except Exception:
+                    dumped = repr(payload.get("messages", []))
+                self.logger.info(
+                    f"[REQUEST_MESSAGES] count={len(payload.get('messages', []))} "
+                    f"payload={_truncate(dumped, 8000)}"
+                )
+
+            result = self.client.chat.completions.create(**_omit_none(payload))
+
+            if (
+                self.enable_timeline_log
+                and self.logger
+                and self.logger.isEnabledFor(logging.INFO)
+            ):
+                invoke_time = (
+                    pendulum.now("UTC") - invoke_start
+                ).total_seconds() * 1000
+                elapsed = self._get_elapsed_time()
+                self.logger.info(
+                    f"[TIMELINE] T+{elapsed:.2f}ms: API call returned (took {invoke_time:.2f}ms)"
+                )
+
+            return result
+        except openai.BadRequestError as e:
+            safe_msg = self._redact_api_key(str(e))
+            if self.logger and self.logger.isEnabledFor(logging.ERROR):
+                self.logger.error(
+                    f"BadRequestError: {safe_msg} "
+                    f"(model={self.model_setting.get('model')}, "
+                    f"has_tools={bool(self.model_setting.get('tools'))}, "
+                    f"stream={bool(kwargs.get('stream'))})"
+                )
+            raise
+        except openai.APIError as e:
+            safe_msg = self._redact_api_key(str(e))
+            if self.logger and self.logger.isEnabledFor(logging.ERROR):
+                self.logger.error(f"OpenAI APIError: {safe_msg}")
+            raise
+        except Exception as e:
+            safe_msg = self._redact_api_key(str(e))
+            if self.logger and self.logger.isEnabledFor(logging.ERROR):
+                self.logger.error(f"Error invoking model: {safe_msg}")
+            raise Exception(f"Failed to invoke model: {safe_msg}")
+
+    def _attach_images(
+        self,
+        input_messages: List[Dict[str, Any]],
+        image_urls: List[str],
+    ) -> List[Dict[str, Any]]:
+        """
+        Attach image_url content parts to the last user message.
+
+        If `input_messages` has no trailing user message, the first image gets
+        its own user message via `_build_image_message`; remaining images are
+        appended to it. The caller's list is not mutated.
+        """
+        if not image_urls:
+            return input_messages
+
+        input_messages = list(input_messages)
+
+        if not input_messages or input_messages[-1].get("role") != "user":
+            input_messages.append(self._build_image_message(image_urls[0]))
+            image_urls = image_urls[1:]
+
+        if not image_urls:
+            return input_messages
+
+        last = input_messages[-1]
+        existing = last.get("content")
+        if isinstance(existing, str):
+            content = [{"type": "text", "text": existing}] if existing else []
+        elif isinstance(existing, list):
+            content = list(existing)
+        else:
+            content = []
+
+        for url in image_urls:
+            self._validate_image_url(url)
+            content.append({"type": "image_url", "image_url": {"url": url}})
+
+        input_messages[-1] = {**last, "content": content}
+        return input_messages
+
+    def _send_terminal_stream_error(
+        self,
+        message: str,
+        stream_event: threading.Event = None,
+    ) -> None:
+        """Emit a final stream frame when ask_model fails mid-stream."""
+        try:
+            self.send_data_to_stream(
+                index=0,
+                data_format="text",
+                chunk_delta=f"\n[error] {message}",
+                is_message_end=True,
+            )
+        except Exception as exc:
+            if self.logger and self.logger.isEnabledFor(logging.WARNING):
+                self.logger.warning(
+                    "Failed to emit terminal stream error frame: %s",
+                    exc,
+                )
+        finally:
+            if stream_event:
+                stream_event.set()
+
+    def _finalize_terminal_error_output(
+        self,
+        message: str,
+        message_id: Optional[str] = None,
+    ) -> str:
+        """Populate final_output for terminal handler errors."""
+        safe_message = self._redact_api_key(str(message))
+        run = getattr(self, "_run", None)
+        run_uuid = run.get("run_uuid") if isinstance(run, dict) else None
+        final_message_id = (
+            message_id
+            or getattr(self, "_last_request_id", None)
+            or run_uuid
+            or f"openai-completions-error-{pendulum.now('UTC').int_timestamp}"
+        )
+        content = f"[error] {safe_message}"
+        self.final_output.update(
+            {
+                "message_id": final_message_id,
+                "role": "assistant",
+                "content": content,
+            }
+        )
+        self.accumulated_text = content
+        return final_message_id
+
+    def _build_client(
+        self, config: Dict[str, Any], api_key: Optional[str]
+    ) -> openai.OpenAI:
+        """SDK client on the pooled httpx client, SDK retries off (D7)."""
+        return openai.OpenAI(
+            api_key=api_key,
+            base_url=config.get("base_url"),
+            http_client=self._http_client,
+            max_retries=0,
+        )
+
+    @performance_monitor.monitor_operation(operation_name="OpenAICompletions")
+    def ask_model(
+        self,
+        input_messages: List[Dict[str, Any]],
+        queue: Queue = None,
+        stream_event: threading.Event = None,
+        input_images: Optional[List[str]] = None,
+        model_setting: Dict[str, Any] = None,
+    ) -> Optional[str]:
+        if self.enable_timeline_log:
+            ask_model_start = pendulum.now("UTC")
+
+        if not hasattr(self, "_ask_model_depth"):
+            self._ask_model_depth = 0
+        self._ask_model_depth += 1
+        is_top_level = self._ask_model_depth == 1
+
+        # Establish per-run state here rather than relying on __init__:
+        # handler instances are cached and reused across requests, so building
+        # these in __init__ and mutating them in place (final_output.update(...))
+        # meant concurrent runs shared one set of containers and overwrote each
+        # other's results — final_output *is* the response payload. Rebinding,
+        # never mutating, is what isolates each run.
+        #
+        # Only at top level: this method recurses for tool-call follow-ups, and
+        # final_output / _short_term_memory accumulate across those levels.
+        #
+        # Inlined rather than a base-class helper on purpose: llm_provider_base
+        # is a separately installed package, so calling a new base method would
+        # raise AttributeError wherever that package is older than this one.
+        if is_top_level:
+            self.accumulated_text = ""
+            self.final_output = {}
+            self.uploaded_files = []
+            self._short_term_memory = []
+            # Track whether ANY handle_stream in this conversation has already
+            # sent a `content_part.added` signal to the wire. Multiple tool
+            # rounds emit multiple handle_stream invocations but should collapse
+            # into a single logical message from the WebSocket consumer's view:
+            # message_end fires exactly once, at the terminal round.
+            self._conversation_content_started = False
+
+        if is_top_level and self.enable_timeline_log:
+            self._global_start_time = ask_model_start
+            if self.logger and self.logger.isEnabledFor(logging.INFO):
+                self.logger.info("[TIMELINE] T+0ms: Run started")
+        else:
+            if (
+                self.enable_timeline_log
+                and self.logger
+                and self.logger.isEnabledFor(logging.INFO)
+            ):
+                elapsed = self._get_elapsed_time()
+                self.logger.info(
+                    f"[TIMELINE] T+{elapsed:.2f}ms: Recursive ask_model call started (depth={self._ask_model_depth})"
+                )
+
+        try:
+            if not self.client:
+                if self.logger and self.logger.isEnabledFor(logging.ERROR):
+                    self.logger.error("No OpenAI client provided.")
+                return None
+
+            stream = True if queue is not None else False
+
+            if model_setting:
+                # Rebind rather than mutate: model_setting is built once in
+                # __init__ and shared with every other instance of this cached
+                # handler, so an in-place update would leak this request's
+                # overrides into all later requests.
+                self.model_setting = {**self.model_setting, **model_setting}
+                self._tools_cache_valid = False
+
+            if input_images:
+                input_messages = self._attach_images(input_messages, input_images)
+
+            if (
+                self.enable_timeline_log
+                and self.logger
+                and self.logger.isEnabledFor(logging.INFO)
+            ):
+                preparation_time = (
+                    pendulum.now("UTC") - ask_model_start
+                ).total_seconds() * 1000
+                elapsed = self._get_elapsed_time()
+                self.logger.info(
+                    f"[TIMELINE] T+{elapsed:.2f}ms: Preparation complete (took {preparation_time:.2f}ms)"
+                )
+
+            # Single-turn (plan D2/A.4): one model call per turn — tool
+            # branches return neutral tool_calls; agent_engine owns the loop.
+            call_start = pendulum.now("UTC")
+            response = self.invoke_model(
+                messages=input_messages,
+                stream=stream,
+            )
+            latency_ms = (pendulum.now("UTC") - call_start).total_seconds() * 1000
+            self._last_latency_ms = latency_ms
+
+            if stream:
+                run_id = self.handle_stream(
+                    response,
+                    input_messages,
+                    queue=queue,
+                    stream_event=stream_event,
+                )
+            else:
+                run_id = self.handle_response(response, input_messages)
+        except openai.APIError as e:
+            safe_msg = self._redact_api_key(str(e))
+            if is_top_level and stream:
+                self._send_terminal_stream_error(safe_msg, stream_event)
+            raise
+        except Exception as e:
+            safe_msg = self._redact_api_key(str(e))
+            if self.logger and self.logger.isEnabledFor(logging.ERROR):
+                self.logger.error(f"Error in ask_model: {safe_msg}")
+            if is_top_level and stream:
+                self._send_terminal_stream_error(safe_msg, stream_event)
+            raise Exception(f"Failed to process model request: {safe_msg}")
+        finally:
+            self._ask_model_depth -= 1
+            if self._ask_model_depth == 0:
+                if (
+                    self.enable_timeline_log
+                    and self.logger
+                    and self.logger.isEnabledFor(logging.INFO)
+                ):
+                    elapsed = self._get_elapsed_time()
+                    self.logger.info(f"[TIMELINE] T+{elapsed:.2f}ms: Run complete")
+                self._global_start_time = None
+        return run_id
+
+    def _get_tool_parameters_schema(self, name: str) -> Optional[Dict[str, Any]]:
+        """Return the `parameters` JSON schema for a registered tool, or None."""
+        if not name:
+            return None
+        for tool in self.model_setting.get("tools") or []:
+            function = tool.get("function") or {}
+            if function.get("name") == name:
+                return function.get("parameters")
+        return None
+
+    def _coerce_arguments_to_schema(self, name: str, arguments: Any) -> Any:
+        """Apply schema-driven coercion to LLM-emitted arguments."""
+        schema = self._get_tool_parameters_schema(name)
+        if not isinstance(schema, dict):
+            if self.logger and self.logger.isEnabledFor(logging.INFO):
+                self.logger.info(
+                    f"[SCHEMA_COERCE] no schema found for tool={name!r}; "
+                    f"registered tools={[((t.get('function') or {}).get('name')) for t in (self.model_setting.get('tools') or [])]}"
+                )
+            return arguments
+        coerced = self._coerce_to_schema(arguments, schema)
+        if (
+            coerced != arguments
+            and self.logger
+            and self.logger.isEnabledFor(logging.INFO)
+        ):
+            self.logger.info(
+                f"[SCHEMA_COERCE] tool={name!r} coerced "
+                f"before={_truncate(Serializer.json_dumps(arguments))} "
+                f"after={_truncate(Serializer.json_dumps(coerced))}"
+            )
+        return coerced
+
+    @staticmethod
+    def _coerce_to_schema(value: Any, schema: Dict[str, Any]) -> Any:
+        """
+        Coerce a value to match its expected JSON-schema type.
+
+        Handles the specific coercions LLMs get wrong most often:
+          - string containing a JSON array/object -> the parsed array/object
+          - string containing a number             -> integer / number
+          - string "true"/"false"                  -> boolean
+
+        Recurses into declared object properties and array items. Anything
+        without a schema (or where the schema doesn't demand a different
+        type) is returned unchanged, so this is safe to run alongside the
+        heuristic _unwrap_stringified_json fallback.
+        """
+        expected = schema.get("type") if isinstance(schema, dict) else None
+        if expected is None:
+            return value
+
+        # Handle union types by trying each until one produces a change.
+        if isinstance(expected, list):
+            for t in expected:
+                if t in {"array", "object", "integer", "number", "boolean"}:
+                    coerced = OpenAIChatProvider._coerce_to_schema(
+                        value, {**schema, "type": t}
+                    )
+                    if coerced is not value:
+                        return coerced
+            return value
+
+        if expected == "array" and isinstance(value, str):
+            stripped = value.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                try:
+                    value = json.loads(stripped)
+                except (json.JSONDecodeError, ValueError):
+                    return value
+        elif expected == "object" and isinstance(value, str):
+            stripped = value.strip()
+            if stripped.startswith("{") and stripped.endswith("}"):
+                try:
+                    value = json.loads(stripped)
+                except (json.JSONDecodeError, ValueError):
+                    return value
+        elif expected == "integer" and isinstance(value, str):
+            try:
+                return int(value.strip())
+            except (ValueError, TypeError):
+                return value
+        elif expected == "number" and isinstance(value, str):
+            try:
+                return float(value.strip())
+            except (ValueError, TypeError):
+                return value
+        elif expected == "boolean" and isinstance(value, str):
+            s = value.strip().lower()
+            if s in {"true", "false"}:
+                return s == "true"
+            return value
+
+        # Recurse into structured types when the shape now matches the schema.
+        if expected == "object" and isinstance(value, dict):
+            properties = schema.get("properties") or {}
+            return {
+                k: OpenAIChatProvider._coerce_to_schema(
+                    v, properties.get(k, {})
+                )
+                for k, v in value.items()
+            }
+        if expected == "array" and isinstance(value, list):
+            items_schema = schema.get("items") or {}
+            return [
+                OpenAIChatProvider._coerce_to_schema(item, items_schema)
+                for item in value
+            ]
+
+        return value
+
+    @staticmethod
+    def _parse_json_container_text(value: Any) -> Any:
+        """Parse JSON object/array strings; return every other value unchanged."""
+        if not isinstance(value, str):
+            return value
+
+        stripped = value.strip()
+        is_container = (stripped.startswith("{") and stripped.endswith("}")) or (
+            stripped.startswith("[") and stripped.endswith("]")
+        )
+        if not is_container:
+            return value
+
+        try:
+            return json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            return value
+
+    @staticmethod
+    def _unwrap_stringified_json(obj: Any) -> Any:
+        """
+        Recursively unwrap JSON object/array strings inside tool arguments.
+
+        Some local or instruction-tuned models double-encode structured values,
+        for example emitting a string that contains a JSON array where the MCP
+        tool schema expects the array itself. Ordinary strings are preserved.
+        """
+        if isinstance(obj, dict):
+            return {
+                k: OpenAIChatProvider._unwrap_stringified_json(v)
+                for k, v in obj.items()
+            }
+        if isinstance(obj, list):
+            return [
+                OpenAIChatProvider._unwrap_stringified_json(v) for v in obj
+            ]
+
+        parsed = OpenAIChatProvider._parse_json_container_text(obj)
+        if parsed is not obj:
+            return OpenAIChatProvider._unwrap_stringified_json(parsed)
+        return obj
+
+    @classmethod
+    def _tool_content_for_llm(cls, content: Any) -> str:
+        """Tool-result content for the next request: unwrap an MCP text
+        envelope (``[{"type": "text", "text": ...}]``) so the model sees the
+        inner result, then serialize non-string results."""
+        parsed = content
+        if isinstance(content, str) and content.lstrip().startswith("["):
+            try:
+                parsed = json.loads(content)
+            except (TypeError, ValueError):
+                return content
+        normalized = cls._normalize_tool_output_for_llm(parsed)
+        if normalized is parsed and parsed is not content:
+            return content  # not an MCP envelope — keep the original text
+        if isinstance(normalized, str):
+            return normalized
+        return json.dumps(normalized, ensure_ascii=False, default=str)
+
+    @staticmethod
+    def _normalize_tool_output_for_llm(output: Any) -> Any:
+        """
+        Strip MCP transport wrappers before writing Chat Completions tool output.
+
+        MCP HTTP tools often return text content parts like
+        ``[{"type": "text", "text": "{...}"}]``. The follow-up model request
+        should contain the inner tool result, not the MCP content envelope.
+        """
+        if not isinstance(output, list) or not output:
+            return output
+
+        text_parts: List[str] = []
+        for item in output:
+            if not (
+                isinstance(item, dict)
+                and item.get("type") == "text"
+                and isinstance(item.get("text"), str)
+            ):
+                return output
+            text_parts.append(item["text"])
+
+        if len(text_parts) != 1:
+            return "\n".join(text_parts)
+
+        return OpenAIChatProvider._parse_json_container_text(text_parts[0])
+
+    @staticmethod
+    def _coerce_tool_call_arguments(raw: str) -> str:
+        """
+        Ensure tool_call arguments is a valid JSON string per the OpenAI
+        Chat Completions spec.
+
+        The spec requires `arguments` to be a JSON-encoded string.  Some
+        providers (Together.ai, vLLM) reject dict/object values with a 400
+        error.  This method validates the string is parseable JSON and
+        returns it as-is.
+
+        Note: GLM-5.2's Jinja2 template calls .items() on the value and fails
+        on a string — that is a Together.ai server bug (they should json.loads
+        the string before template traversal).  We stay spec-compliant here.
+        """
+        if not isinstance(raw, str):
+            return raw
+        try:
+            json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            pass
+        return raw
+
+    def _append_assistant_with_tool_calls(
+        self,
+        function_call_data_list: List[Dict[str, Any]],
+        input_messages: List[Dict[str, Any]],
+    ) -> None:
+        """
+        Append ONE assistant message containing every tool_call from this turn.
+
+        Note: `reasoning_content` is intentionally NOT included on input
+        messages. It is a response-only field; echoing it back to the model
+        on the next turn is non-standard and is rejected by strict providers
+        such as Groq's openai/gpt-oss-* family and OpenAI's official Chat
+        Completions API. The reasoning trace is preserved separately in
+        `self.final_output["reasoning_summary"]` for the caller.
+
+        `arguments` is kept as a JSON string per the OpenAI Chat Completions
+        spec.  Provider deserializers (Together.ai, vLLM) reject dict/object
+        values with a 400 error.  GLM-5.2's Jinja2 template calls .items() on
+        the value and fails on a string — that is a Together.ai server bug.
+        invoke_model() also stringifies any dict arguments before the API call.
+        """
+        input_messages.append(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": fcd["id"],
+                        "type": "function",
+                        "function": {
+                            "name": fcd["name"],
+                            "arguments": self._coerce_tool_call_arguments(
+                                fcd.get("arguments", "{}")
+                            ),
+                        },
+                    }
+                    for fcd in function_call_data_list
+                ],
+            }
+        )
+
+    def _append_tool_result(
+        self,
+        tool_call_id: str,
+        content: str,
+        input_messages: List[Dict[str, Any]],
+    ) -> None:
+        """Append one role:'tool' result message bound to its parent tool_call_id."""
+        input_messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": content,
+            }
+        )
+
+    def handle_response(
+        self,
+        response: Any,
+        input_messages: List[Dict[str, Any]],
+        retry_count: int = 0,
+    ) -> str:
+        self._check_retry_limit(retry_count)
+
+        message = response.choices[0].message
+        content = message.content or ""
+        tool_calls = message.tool_calls
+        reasoning_content = self._get_reasoning_content(message)
+        content, inline_reasoning = self._split_inline_reasoning(content)
+        if inline_reasoning:
+            reasoning_content = (reasoning_content or "") + inline_reasoning
+        finish_reason = response.choices[0].finish_reason
+
+        self._last_usage = response.usage
+        self._last_finish_reason = finish_reason
+        self._last_request_id = response.id
+
+        tool_call_count = len(tool_calls) if tool_calls else 0
+        self._log_model_call(
+            model=self.model_setting.get("model", ""),
+            request_id=response.id,
+            stream=False,
+            tool_call_count=tool_call_count,
+            usage=response.usage,
+            latency_ms=self._last_latency_ms,
+            finish_reason=finish_reason,
+            retry_count=retry_count,
+        )
+
+        if reasoning_content:
+            self.final_output["reasoning_summary"] = self._apply_reasoning_mask(
+                reasoning_content
+            )
+
+        if tool_calls:
+            # Single-turn (plan D2/A.4): return neutral tool_calls to
+            # agent_engine instead of executing tools in-handler.
+            neutral_tool_calls = [
+                {
+                    "id": str(getattr(tc, "id", "") or ""),
+                    "type": "function",
+                    "function": {
+                        "name": str(getattr(tc.function, "name", "") or ""),
+                        "arguments": str(
+                            getattr(tc.function, "arguments", "") or "{}"
+                        ),
+                    },
+                }
+                for tc in tool_calls
+            ]
+            self.final_output.update(
+                {
+                    "message_id": response.id,
+                    "role": getattr(message, "role", "assistant"),
+                    "content": content,
+                    "tool_calls": neutral_tool_calls,
+                    "finish_reason": finish_reason or "tool_calls",
+                    "usage": self._map_usage(getattr(response, "usage", None)),
+                }
+            )
+            return response.id
+
+        if finish_reason == "length":
+            self.final_output["truncated"] = True
+        if finish_reason == "content_filter":
+            self.final_output["filtered"] = True
+
+        if not self._has_valid_content(content) and not reasoning_content:
+            if self.logger and self.logger.isEnabledFor(logging.WARNING):
+                self.logger.warning(
+                    f"Empty response, retrying (attempt {retry_count + 1}/2)..."
+                )
+            next_response = self.invoke_model(
+                messages=input_messages,
+                stream=False,
+            )
+            self.handle_response(
+                next_response, input_messages, retry_count=retry_count + 1
+            )
+            return response.id
+
+        if not self._has_valid_content(content):
+            content = self._empty_visible_content_message(finish_reason)
+
+        self.final_output.update(
+            {
+                "message_id": response.id,
+                "role": message.role,
+                "content": content,
+                "finish_reason": finish_reason or "stop",
+                "usage": self._map_usage(response.usage),
+            }
+        )
+
+        return response.id
+
+    def handle_stream(
+        self,
+        response_stream: Any,
+        input_messages: List[Dict[str, Any]],
+        queue: Queue = None,
+        stream_event: threading.Event = None,
+        retry_count: int = 0,
+    ) -> str | None:
+        self._check_retry_limit(retry_count)
+
+        run_id = None
+        role = None
+        accumulated_text_parts = []
+        accumulated_partial_text_parts = []
+        accumulated_partial_json_parts = []
+        accumulated_reasoning_parts = []
+        accumulated_partial_reasoning_parts = []
+        received_any_content = False
+        tool_turn_pending = False
+        output_format = self.output_format_type
+        index = 0
+        reasoning_index = 0
+        tool_call_count = 0
+        finish_reason = None
+
+        tool_call_accumulators: Dict[int, Dict[str, Any]] = {}
+
+        if self.enable_timeline_log:
+            stream_start_time = pendulum.now("UTC")
+
+        first_delta_logged = False
+        # Optional fallback for compatible servers that emit inline <think>
+        # tags instead of the provider's dedicated reasoning_content field.
+        # Off by default; enable via configuration.enable_think_tag_split.
+        think_splitter = _ThinkTagSplitter() if self._enable_think_tag_split else None
+
+        # WebSocket lifecycle state matching llm_provider_openai's pattern.
+        content_message_started = False
+        reasoning_active = False
+        reasoning_no = 0
+
+        for chunk in response_stream:
+            # Stop streaming if the client disconnected mid-generation.
+            if self.is_stream_cancelled():
+                self.logger.info(
+                    "Stream cancelled (client disconnected); stopping generation."
+                )
+                break
+            if run_id is None:
+                run_id = chunk.id
+                if queue:
+                    queue.put({"name": "run_id", "value": chunk.id})
+
+            if not chunk.choices:
+                if chunk.usage:
+                    self._last_usage = chunk.usage
+                continue
+
+            choice = chunk.choices[0]
+            delta = choice.delta
+            finish_reason = choice.finish_reason
+
+            # One-time diagnostic: log the keys present in the first delta so a
+            # provider returning reasoning in a non-standard field is visible.
+            if (
+                not first_delta_logged
+                and self.logger
+                and self.logger.isEnabledFor(logging.INFO)
+            ):
+                first_delta_logged = True
+                try:
+                    delta_dump = delta.model_dump(exclude_none=True)
+                    self.logger.info(
+                        f"[STREAM_DELTA_KEYS] first delta keys={list(delta_dump.keys())} "
+                        f"sample={_truncate(str(delta_dump))}"
+                    )
+                except Exception:
+                    self.logger.info(
+                        f"[STREAM_DELTA_KEYS] first delta attrs="
+                        f"{[a for a in dir(delta) if not a.startswith('_')]}"
+                    )
+
+            if getattr(delta, "content", None):
+                received_any_content = True
+                # Optionally split any inline <think>...</think> blocks out
+                # of content (opt-in via configuration.enable_think_tag_split).
+                # Pass-through when disabled.
+                if think_splitter is not None:
+                    content_part, think_part = think_splitter.feed(delta.content)
+                else:
+                    content_part, think_part = delta.content, ""
+                if think_part:
+                    reasoning_active = True
+                    think_part = self._apply_reasoning_mask(think_part)
+                    print(think_part, end="", flush=True)
+                    accumulated_reasoning_parts.append(think_part)
+                    accumulated_partial_reasoning_parts.append(think_part)
+                    reasoning_index, remaining_reasoning = self.process_text_content(
+                        reasoning_index,
+                        "".join(accumulated_partial_reasoning_parts),
+                        "text",
+                        suffix=f"rs#{reasoning_no}",
+                    )
+                    accumulated_partial_reasoning_parts = (
+                        [remaining_reasoning] if remaining_reasoning else []
+                    )
+                if content_part:
+                    # Transition from reasoning to content: flush leftover
+                    # reasoning text and close the reasoning block before
+                    # opening the content message.
+                    if reasoning_active:
+                        if accumulated_partial_reasoning_parts:
+                            self.send_data_to_stream(
+                                index=reasoning_index,
+                                data_format="text",
+                                chunk_delta="".join(
+                                    accumulated_partial_reasoning_parts
+                                ),
+                                suffix=f"rs#{reasoning_no}",
+                            )
+                            accumulated_partial_reasoning_parts = []
+                            reasoning_index += 1
+                        reasoning_active = False
+                        reasoning_no += 1
+
+                    # Signal start of content message on the first content delta.
+                    if not content_message_started:
+                        content_message_started = True
+                        self._conversation_content_started = True
+                        if index == 0 and reasoning_index > 0:
+                            index = reasoning_index + 1
+                        self.send_data_to_stream(
+                            index=index,
+                            data_format=output_format,
+                        )
+                        index += 1
+
+                    print(content_part, end="", flush=True)
+                    accumulated_text_parts.append(content_part)
+
+                    if output_format in ["json_object", "json_schema"]:
+                        accumulated_partial_json_parts.append(content_part)
+                        temp_text = "".join(accumulated_text_parts)
+                        index, temp_text, remaining_json = self.process_and_send_json(
+                            index,
+                            temp_text,
+                            "".join(accumulated_partial_json_parts),
+                            output_format,
+                        )
+                        accumulated_partial_json_parts = (
+                            [remaining_json] if remaining_json else []
+                        )
+                    else:
+                        accumulated_partial_text_parts.append(content_part)
+                        index, remaining_text = self.process_text_content(
+                            index,
+                            "".join(accumulated_partial_text_parts),
+                            output_format,
+                        )
+                        accumulated_partial_text_parts = (
+                            [remaining_text] if remaining_text else []
+                        )
+
+            # Providers use different field names for streamed reasoning chunks:
+            #   SGLang / Qwen3 / OpenAI o-series / GLM via SGLang -> reasoning_content
+            #   Anthropic Claude on some Bedrock paths             -> thinking
+            #   Some misc proxies                                  -> reasoning
+            reasoning_content = self._get_reasoning_content(delta)
+            if reasoning_content:
+                received_any_content = True
+                reasoning_active = True
+                reasoning_content = self._apply_reasoning_mask(reasoning_content)
+                print(reasoning_content, end="", flush=True)
+                accumulated_reasoning_parts.append(reasoning_content)
+                accumulated_partial_reasoning_parts.append(reasoning_content)
+                reasoning_index, remaining_reasoning = self.process_text_content(
+                    reasoning_index,
+                    "".join(accumulated_partial_reasoning_parts),
+                    "text",
+                    suffix=f"rs#{reasoning_no}",
+                )
+                accumulated_partial_reasoning_parts = (
+                    [remaining_reasoning] if remaining_reasoning else []
+                )
+
+            if getattr(delta, "tool_calls", None):
+                received_any_content = True
+                tool_call_count += 1
+                for tc_delta in delta.tool_calls:
+                    idx = tc_delta.index
+                    acc = tool_call_accumulators.setdefault(
+                        idx,
+                        {"id": None, "type": "function", "name": "", "arguments": ""},
+                    )
+                    if getattr(tc_delta, "id", None):
+                        acc["id"] = tc_delta.id
+                    if getattr(tc_delta, "function", None):
+                        if getattr(tc_delta.function, "name", None):
+                            acc["name"] += tc_delta.function.name
+                        if getattr(tc_delta.function, "arguments", None):
+                            acc["arguments"] += tc_delta.function.arguments
+
+            if finish_reason:
+                self._last_finish_reason = finish_reason
+
+                if finish_reason == "tool_calls":
+                    # Close out any open reasoning / content message group on
+                    # the wire before recursing into the tool-call round.
+                    # Otherwise a model that emitted text + tool_calls in the
+                    # same turn would leave the content message unterminated
+                    # from the WebSocket consumer's perspective.
+                    if reasoning_active and accumulated_partial_reasoning_parts:
+                        self.send_data_to_stream(
+                            index=reasoning_index,
+                            data_format="text",
+                            chunk_delta="".join(accumulated_partial_reasoning_parts),
+                            suffix=f"rs#{reasoning_no}",
+                        )
+                        accumulated_partial_reasoning_parts = []
+                        reasoning_index += 1
+                        reasoning_active = False
+                        reasoning_no += 1
+                    if accumulated_partial_text_parts:
+                        self.send_data_to_stream(
+                            index=index,
+                            data_format=output_format,
+                            chunk_delta="".join(accumulated_partial_text_parts),
+                        )
+                        accumulated_partial_text_parts = []
+                        index += 1
+                    # NOTE: intentionally NOT sending is_message_end here.
+                    # Multiple tool-call rounds collapse into ONE logical
+                    # WebSocket message; message_end fires exactly once in the
+                    # terminal post-loop cleanup. Partial flushes above still
+                    # push in-flight chunks so the consumer never stalls.
+
+                    # Single-turn (plan D2/A.4): tool calls collected —
+                    # keep consuming the stream (the usage-only chunk arrives
+                    # after finish_reason in OpenAI streams with
+                    # stream_options.include_usage).
+                    tool_turn_pending = True
+
+                if finish_reason == "length":
+                    self.final_output["truncated"] = True
+                    if self.logger and self.logger.isEnabledFor(logging.WARNING):
+                        self.logger.warning(
+                            "Stream finished with reason: length (truncated)"
+                        )
+
+                if finish_reason == "content_filter":
+                    self.final_output["filtered"] = True
+                    if self.logger and self.logger.isEnabledFor(logging.WARNING):
+                        self.logger.warning(
+                            "Stream finished with reason: content_filter"
+                        )
+
+                if finish_reason == "stop":
+                    role = getattr(delta, "role", None) or "assistant"
+
+                if finish_reason not in (
+                    "stop",
+                    "tool_calls",
+                    "length",
+                    "content_filter",
+                ):
+                    if self.logger and self.logger.isEnabledFor(logging.WARNING):
+                        self.logger.warning(
+                            f"Unknown finish_reason: {finish_reason}, treating as stop"
+                        )
+                    role = getattr(delta, "role", None) or "assistant"
+
+        # Drain anything still buffered in the think-tag splitter (e.g. a
+        # final segment that arrived without ever crossing a tag boundary).
+        # No-op when the splitter is disabled.
+        if think_splitter is not None:
+            tail_content, tail_think = think_splitter.flush()
+        else:
+            tail_content, tail_think = "", ""
+        if tail_think:
+            reasoning_active = True
+            tail_think = self._apply_reasoning_mask(tail_think)
+            print(tail_think, end="", flush=True)
+            accumulated_reasoning_parts.append(tail_think)
+            accumulated_partial_reasoning_parts.append(tail_think)
+            reasoning_index, remaining_reasoning = self.process_text_content(
+                reasoning_index,
+                "".join(accumulated_partial_reasoning_parts),
+                "text",
+                suffix=f"rs#{reasoning_no}",
+            )
+            accumulated_partial_reasoning_parts = (
+                [remaining_reasoning] if remaining_reasoning else []
+            )
+        if tail_content:
+            # Tail content forces the same reasoning-to-content transition we
+            # do for in-flight deltas above.
+            if reasoning_active:
+                if accumulated_partial_reasoning_parts:
+                    self.send_data_to_stream(
+                        index=reasoning_index,
+                        data_format="text",
+                        chunk_delta="".join(accumulated_partial_reasoning_parts),
+                        suffix=f"rs#{reasoning_no}",
+                    )
+                    accumulated_partial_reasoning_parts = []
+                    reasoning_index += 1
+                reasoning_active = False
+                reasoning_no += 1
+            if not content_message_started:
+                content_message_started = True
+                if index == 0 and reasoning_index > 0:
+                    index = reasoning_index + 1
+                self.send_data_to_stream(
+                    index=index,
+                    data_format=output_format,
+                )
+                index += 1
+            print(tail_content, end="", flush=True)
+            accumulated_text_parts.append(tail_content)
+            if output_format not in ["json_object", "json_schema"]:
+                accumulated_partial_text_parts.append(tail_content)
+
+        # End-of-stream flush: leftover reasoning text, then leftover content
+        # text, then the message-end signal. Mirrors the sibling's pattern of
+        # `response.reasoning_summary_text.done` -> `response.output_text.done`
+        # -> `response.content_part.done`.
+        if reasoning_active and accumulated_partial_reasoning_parts:
+            self.send_data_to_stream(
+                index=reasoning_index,
+                data_format="text",
+                chunk_delta="".join(accumulated_partial_reasoning_parts),
+                suffix=f"rs#{reasoning_no}",
+            )
+            accumulated_partial_reasoning_parts = []
+            reasoning_index += 1
+            reasoning_active = False
+            reasoning_no += 1
+
+        if accumulated_partial_text_parts:
+            self.send_data_to_stream(
+                index=index,
+                data_format=output_format,
+                chunk_delta="".join(accumulated_partial_text_parts),
+            )
+            accumulated_partial_text_parts = []
+            index += 1
+
+        # Terminal round of the conversation — send message_end IF any round
+        # in this conversation (this one or a prior tool-call round) started a
+        # content message. Guarded by the conversation-level flag so a purely
+        # tool-then-empty-final-turn stream still cleanly closes the message.
+        if self._conversation_content_started:
+            self.send_data_to_stream(
+                index=index,
+                data_format=output_format,
+                is_message_end=True,
+            )
+            self._conversation_content_started = False
+
+        final_accumulated_text = "".join(accumulated_text_parts)
+        if not self._has_valid_content(final_accumulated_text):
+            final_accumulated_text = self._empty_visible_content_message(finish_reason)
+
+        if (
+            self.enable_timeline_log
+            and self.logger
+            and self.logger.isEnabledFor(logging.INFO)
+        ):
+            stream_duration_ms = (
+                pendulum.now("UTC") - stream_start_time
+            ).total_seconds() * 1000
+            elapsed = self._get_elapsed_time()
+            self.logger.info(
+                f"[TIMELINE] T+{elapsed:.2f}ms: Stream completed, run_id={run_id} "
+                f"(took {stream_duration_ms:.2f}ms from stream start)"
+            )
+
+        self._last_request_id = run_id
+        self._log_model_call(
+            model=self.model_setting.get("model", ""),
+            request_id=run_id,
+            stream=True,
+            tool_call_count=len(tool_call_accumulators),
+            usage=self._last_usage,
+            latency_ms=self._last_latency_ms,
+            finish_reason=finish_reason,
+            retry_count=retry_count,
+        )
+
+        if not received_any_content:
+            if self.logger and self.logger.isEnabledFor(logging.WARNING):
+                self.logger.warning(
+                    f"Empty stream, retrying (attempt {retry_count + 1}/2)..."
+                )
+            next_response = self.invoke_model(
+                messages=input_messages,
+                stream=True,
+            )
+            self.handle_stream(
+                next_response,
+                input_messages,
+                queue=queue,
+                stream_event=stream_event,
+                retry_count=retry_count + 1,
+            )
+            return run_id
+
+        if accumulated_reasoning_parts:
+            self.final_output["reasoning_summary"] = "".join(
+                accumulated_reasoning_parts
+            )
+
+        if tool_turn_pending:
+            neutral_tool_calls = [
+                {
+                    "id": str(acc["id"] or ""),
+                    "type": "function",
+                    "function": {
+                        "name": str(acc["name"] or ""),
+                        "arguments": str(acc["arguments"] or "{}"),
+                    },
+                }
+                for acc in tool_call_accumulators.values()
+            ]
+        else:
+            neutral_tool_calls = []
+        self.final_output.update(
+            {
+                "message_id": run_id,
+                "role": role or "assistant",
+                "content": final_accumulated_text,
+                "tool_calls": neutral_tool_calls or None,
+                "finish_reason": (
+                    "tool_calls" if tool_turn_pending else finish_reason
+                )
+                or "completed",
+                "usage": self._map_usage(self._last_usage),
+            }
+        )
+        self.accumulated_text = final_accumulated_text
+
+        if stream_event:
+            stream_event.set()
+
+        return run_id
+
+
+class AzureOpenAIChatProvider(OpenAIChatProvider):
+    """Azure OpenAI Chat Completions (plan D8: replaces the llm_engine
+    ``AZURE_OPENAI`` builtin).
+
+    Same request/stream/tool handling as the parent; only the client
+    differs: ``openai.AzureOpenAI`` sends the ``api-key`` header and routes by
+    deployment name. ``configuration``:
+
+    - ``base_url`` (model endpoint) or ``azure_endpoint`` — the resource URL,
+      e.g. ``https://<resource>.openai.azure.com``;
+    - ``api_version`` — Azure REST API version (required);
+    - ``deployment`` — deployment name; defaults to ``model``.
+    """
+
+    api_protocol = "azure-openai"
+    replaces_protocol = "AZURE_OPENAI"
+    display_name = "Azure OpenAI (Chat Completions)"
+    default_pool_name = "httpx_llm_azure"
+    client_config_keys = ("azure_endpoint", "api_version", "deployment")
+
+    def _build_client(
+        self, config: Dict[str, Any], api_key: Optional[str]
+    ) -> openai.OpenAI:
+        endpoint = (config.get("azure_endpoint") or config.get("base_url") or "").strip()
+        api_version = str(config.get("api_version") or "").strip()
+        if not endpoint or not api_version:
+            raise Exception(
+                "AzureOpenAIChatProvider requires configuration "
+                "azure_endpoint (or base_url) and api_version"
+            )
+        # The Azure client builds /openai/deployments/{deployment}/... from
+        # azure_endpoint; a base_url that already carries that path would
+        # be doubled, so only the resource root is used.
+        root = endpoint.rstrip("/")
+        marker = "/openai"
+        if marker in root:
+            root = root[: root.index(marker)]
+        deployment = str(config.get("deployment") or config.get("model") or "")
+        return openai.AzureOpenAI(
+            api_key=api_key,
+            azure_endpoint=root,
+            azure_deployment=deployment or None,
+            api_version=api_version,
+            http_client=self._http_client,
+            max_retries=0,
+        )

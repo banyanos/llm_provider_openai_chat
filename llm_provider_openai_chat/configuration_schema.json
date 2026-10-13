@@ -1,0 +1,272 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "OpenAI Completions Configuration Schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+        "model"
+    ],
+    "definitions": {
+        "paramSchema": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["type"],
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": ["string", "number", "integer", "boolean", "object", "array"]
+                },
+                "description": {"type": "string"},
+                "properties": {
+                    "type": "object",
+                    "additionalProperties": {"$ref": "#/definitions/paramSchema"}
+                },
+                "items": {"$ref": "#/definitions/paramSchema"},
+                "required": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                }
+            }
+        },
+        "toolParameters": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "properties"],
+            "properties": {
+                "type": {"const": "object"},
+                "properties": {
+                    "type": "object",
+                    "additionalProperties": {"$ref": "#/definitions/paramSchema"}
+                },
+                "required": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                }
+            }
+        }
+    },
+    "properties": {
+        "model": {
+            "type": "string",
+            "description": "ID of the model that will generate the response (e.g., gpt-4.1, gpt-4o, gpt-5, Qwen/Qwen3-4B)."
+        },
+        "base_url": {
+            "type": "string",
+            "description": "Optional custom base URL for OpenAI-compatible servers (e.g., http://127.0.0.1:30000/v1 for SGLang)."
+        },
+        "max_tokens": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Hard cap on tokens in the model's reply. Legacy field; prefer max_completion_tokens for newer models."
+        },
+        "max_completion_tokens": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 8192,
+            "description": "Hard cap on completion tokens. Preferred over max_tokens for newer OpenAI models. If both are set, this takes precedence. Reasoning-heavy models should set this well above 1024 to avoid truncation before visible final content."
+        },
+        "temperature": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 2,
+            "default": 0.8,
+            "description": "Sampling temperature; higher values increase randomness."
+        },
+        "top_p": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 1.0,
+            "description": "Nucleus sampling probability threshold."
+        },
+        "presence_penalty": {
+            "type": "number",
+            "minimum": -2,
+            "maximum": 2,
+            "default": 0,
+            "description": "Penalty for repeating tokens already in the conversation."
+        },
+        "frequency_penalty": {
+            "type": "number",
+            "minimum": -2,
+            "maximum": 2,
+            "default": 0,
+            "description": "Penalty for repeating the same tokens frequently."
+        },
+        "seed": {
+            "type": "integer",
+            "description": "Seed for deterministic sampling. Supported by OpenAI and SGLang."
+        },
+        "stop": {
+            "oneOf": [
+                {"type": "string"},
+                {"type": "array", "items": {"type": "string"}, "maxItems": 4}
+            ],
+            "description": "Stop sequences to halt generation."
+        },
+        "logit_bias": {
+            "type": "object",
+            "description": "Token ID to bias value mapping (-100 to 100). Supported by SGLang.",
+            "additionalProperties": {"type": "number"}
+        },
+        "extra_body": {
+            "type": "object",
+            "description": "Passthrough object for provider-specific body fields (e.g., SGLang chat_template_kwargs/separate_reasoning or Z.AI GLM thinking).",
+            "additionalProperties": true
+        },
+        "extra_headers": {
+            "type": "object",
+            "description": "Passthrough object for additional HTTP request headers (e.g., proxy auth, request tracing, custom routing headers). Forwarded verbatim to chat.completions.create().",
+            "additionalProperties": {"type": "string"}
+        },
+        "extra_query": {
+            "type": "object",
+            "description": "Passthrough object for additional URL query string parameters. Forwarded verbatim to chat.completions.create().",
+            "additionalProperties": true
+        },
+        "enable_thinking": {
+            "type": "boolean",
+            "description": "SGLang/Qwen3 shorthand: when true, the handler adds chat_template_kwargs.enable_thinking=true to extra_body. Overridden by any value the caller sets explicitly in extra_body."
+        },
+        "separate_reasoning": {
+            "type": "boolean",
+            "description": "SGLang shorthand: when true, the handler adds separate_reasoning=true to extra_body so the server splits reasoning into the reasoning_content field. Overridden by any value the caller sets explicitly in extra_body."
+        },
+        "reasoning_effort": {
+            "type": "string",
+            "enum": ["low", "medium", "high"],
+            "description": "Reasoning effort for Chat Completions endpoints that implement this parameter, including zai.glm-5 through Bedrock Mantle. Direct Z.AI GLM endpoints configure thinking through extra_body.thinking instead."
+        },
+        "enable_think_tag_split": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true, the streaming handler scans content for inline <think>...</think> blocks and routes them to the reasoning channel. Enable only for servers that fail to populate delta.reasoning_content and emit raw <think> tags instead (e.g. vLLM with GLM-5 hitting parser bug #29763, DeepSeek/Qwen3 without a reasoning parser flag). Off by default."
+        },
+        "reasoning_mask_char": {
+            "type": ["string", "null"],
+            "default": null,
+            "description": "Optional single-character mask for reasoning content streamed to stdout, the WebSocket, and stored in final_output.reasoning_summary. When set to a non-empty single character (e.g. `*`, `·`, ` `), every non-whitespace reasoning char is replaced with it (length preserved so the client sees that reasoning is in progress without exposing the text). Leave null or blank to stream reasoning as-is (default)."
+        },
+        "debug_log_request_messages": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true, log a truncated JSON dump of the `messages` array (up to 8000 chars) before every chat.completions.create() call, tagged [REQUEST_MESSAGES]. Diagnostic only — use to inspect on-wire message shape when a provider rejects the request. Off by default; noisy in production."
+        },
+        "tool_history_compatibility": {
+            "type": "string",
+            "enum": ["auto", "strict", "flatten"],
+            "default": "auto",
+            "description": "Controls follow-up requests after tool execution. 'strict' preserves standard Chat Completions assistant.tool_calls plus role:tool messages. 'flatten' renders prior tool calls/results as plain text for provider templates that reject strict tool history. 'auto' enables flattening only for known incompatible providers such as Together.ai GLM."
+        },        "instructions_role": {
+            "type": "string",
+            "enum": ["system", "developer", "user"],
+            "default": "system",
+            "description": "Where to put the agent's instructions. 'system' (default) emits a leading system message; 'developer' is for newer OpenAI models; 'user' merges the instructions into the first user message and is required for models like Gemma whose chat templates reject the system role."
+        },
+        "response_format": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Controls structured output formatting.",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": ["json_object", "json_schema", "text"]
+                },
+                "json_schema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "schema": {"type": "object"}
+                    }
+                }
+            }
+        },
+        "tools": {
+            "type": "array",
+            "description": "Function declarations compatible with OpenAI Chat Completions API.",
+            "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["type", "function"],
+                "properties": {
+                    "type": {"const": "function"},
+                    "function": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "description": {"type": "string"},
+                            "parameters": {"$ref": "#/definitions/toolParameters"}
+                        },
+                        "required": ["name", "parameters"]
+                    }
+                }
+            }
+        },
+        "tool_choice": {
+            "oneOf": [
+                {
+                    "type": "string",
+                    "enum": ["auto", "none", "required"]
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "type": {"const": "function"},
+                        "function": {
+                            "type": "object",
+                            "properties": {"name": {"type": "string"}},
+                            "required": ["name"]
+                        }
+                    },
+                    "required": ["type", "function"]
+                }
+            ]
+        },
+        "parallel_tool_calls": {
+            "type": "boolean",
+            "default": true,
+            "description": "Whether to allow the model to call multiple tools in parallel."
+        },
+        "enabled_tools": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Subset of tool names to enable. Other tools are filtered out at initialization."
+        },
+        "request_timeout_seconds": {
+            "type": "number",
+            "minimum": 1,
+            "default": 120.0,
+            "description": "Total request timeout in seconds for the httpx client."
+        },
+        "connect_timeout_seconds": {
+            "type": "number",
+            "minimum": 1,
+            "default": 10.0,
+            "description": "Connection timeout in seconds for the httpx client."
+        },
+        "pool_max_connections": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 20,
+            "description": "Maximum number of connections in the httpx pool."
+        },
+        "pool_max_keepalive_connections": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 10,
+            "description": "Maximum number of keep-alive connections in the httpx pool."
+        },
+        "azure_endpoint": {
+            "type": "string",
+            "description": "Azure OpenAI only (azure-openai protocol): resource URL, e.g. https://<resource>.openai.azure.com. Defaults to base_url."
+        },
+        "api_version": {
+            "type": "string",
+            "description": "Azure OpenAI only: REST API version (required for azure-openai)."
+        },
+        "deployment": {
+            "type": "string",
+            "description": "Azure OpenAI only: deployment name. Defaults to model."
+        }
+    }
+}
