@@ -14,7 +14,12 @@ from typing import Any, Dict, List, Optional
 
 import openai
 import pendulum
-from llm_provider_base import LlmProviderHandler
+from llm_provider_base import (
+    LlmProviderHandler,
+    bearer,
+    endpoint_base,
+    fetch_upstream_models,
+)
 from silvaengine_utility import Debugger, Serializer
 from silvaengine_utility.performance_monitor import performance_monitor
 
@@ -117,6 +122,14 @@ class OpenAIChatProvider(LlmProviderHandler):
         "list_models": True,
     }
     default_pool_name = "httpx_llm_openai"
+
+    @classmethod
+    def list_models(cls, ctx: Any) -> List[Dict[str, str]]:
+        """OpenAI-compatible model list: ``GET {endpoint}/models``."""
+        return fetch_upstream_models(
+            ctx, f"{endpoint_base(ctx, 'https://api.openai.com/v1')}/models",
+            headers=bearer(ctx),
+        )
     #: Configuration keys that configure the client, never sent as request
     #: parameters (subclasses extend this, e.g. Azure).
     client_config_keys: tuple = ()
@@ -1605,7 +1618,6 @@ class OpenAIChatProvider(LlmProviderHandler):
                 if think_part:
                     reasoning_active = True
                     think_part = self._apply_reasoning_mask(think_part)
-                    print(think_part, end="", flush=True)
                     accumulated_reasoning_parts.append(think_part)
                     accumulated_partial_reasoning_parts.append(think_part)
                     reasoning_index, remaining_reasoning = self.process_text_content(
@@ -1648,7 +1660,6 @@ class OpenAIChatProvider(LlmProviderHandler):
                         )
                         index += 1
 
-                    print(content_part, end="", flush=True)
                     accumulated_text_parts.append(content_part)
 
                     if output_format in ["json_object", "json_schema"]:
@@ -1683,7 +1694,6 @@ class OpenAIChatProvider(LlmProviderHandler):
                 received_any_content = True
                 reasoning_active = True
                 reasoning_content = self._apply_reasoning_mask(reasoning_content)
-                print(reasoning_content, end="", flush=True)
                 accumulated_reasoning_parts.append(reasoning_content)
                 accumulated_partial_reasoning_parts.append(reasoning_content)
                 reasoning_index, remaining_reasoning = self.process_text_content(
@@ -1792,7 +1802,6 @@ class OpenAIChatProvider(LlmProviderHandler):
         if tail_think:
             reasoning_active = True
             tail_think = self._apply_reasoning_mask(tail_think)
-            print(tail_think, end="", flush=True)
             accumulated_reasoning_parts.append(tail_think)
             accumulated_partial_reasoning_parts.append(tail_think)
             reasoning_index, remaining_reasoning = self.process_text_content(
@@ -1828,7 +1837,6 @@ class OpenAIChatProvider(LlmProviderHandler):
                     data_format=output_format,
                 )
                 index += 1
-            print(tail_content, end="", flush=True)
             accumulated_text_parts.append(tail_content)
             if output_format not in ["json_object", "json_schema"]:
                 accumulated_partial_text_parts.append(tail_content)
@@ -1977,6 +1985,15 @@ class AzureOpenAIChatProvider(OpenAIChatProvider):
     display_name = "Azure OpenAI (Chat Completions)"
     default_pool_name = "httpx_llm_azure"
     client_config_keys = ("azure_endpoint", "api_version", "deployment")
+    # Azure lists deployments, not models, through a different API.
+    capabilities = {
+        **OpenAIChatProvider.capabilities,
+        "list_models": False,
+    }
+
+    @classmethod
+    def list_models(cls, ctx: Any) -> None:
+        return None
 
     def _build_client(
         self, config: Dict[str, Any], api_key: Optional[str]

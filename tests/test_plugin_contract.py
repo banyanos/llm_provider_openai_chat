@@ -399,3 +399,24 @@ def test_azure_requires_api_version():
             _agent(base_url="https://res.openai.azure.com"),
             ctx=_ctx(),
         )
+
+
+def test_list_models_openai_compatible_and_azure_opt_out():
+    from llm_provider_openai_chat import AzureOpenAIChatProvider, OpenAIChatProvider
+
+    seen = {}
+
+    def _respond(request):
+        seen["url"] = str(request.url)
+        seen["auth"] = request.headers.get("authorization")
+        return httpx.Response(200, json={"data": [{"id": "glm-5.3-flash"}, {"id": "kimi-k3"}]})
+
+    ctx = SimpleNamespace(
+        http_client=httpx.Client(transport=httpx.MockTransport(_respond)),
+        endpoint="https://ollama.com/v1", credentials={"api_key": "k1"}, timeout_seconds=5,
+    )
+    models = OpenAIChatProvider.list_models(ctx)
+    assert [m["model_id"] for m in models] == ["glm-5.3-flash", "kimi-k3"]
+    assert seen == {"url": "https://ollama.com/v1/models", "auth": "Bearer k1"}
+    assert AzureOpenAIChatProvider.list_models(ctx) is None
+    assert AzureOpenAIChatProvider.capabilities["list_models"] is False
